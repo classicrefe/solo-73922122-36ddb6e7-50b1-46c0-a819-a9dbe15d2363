@@ -11,6 +11,10 @@ echo "=== functional + lifecycle tests ==="
 "$PY" -I tests/test_api.py
 
 echo
+echo "=== cleanup-pending finalization tests ==="
+"$PY" -I tests/test_cleanup.py
+
+echo
 echo "=== cancel/complete arbitration tests ==="
 "$PY" -I tests/test_cancel_race.py
 

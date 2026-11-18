@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     r2_bytes        INTEGER NOT NULL DEFAULT 0,
     result_r1       TEXT NOT NULL DEFAULT '',
     result_r2       TEXT NOT NULL DEFAULT '',
+    final_status    TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -46,7 +47,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_records_lookup
     ON records (task_id, side, read_id);
 """
 
-_TERMINAL_STATUSES = ("succeeded", "failed", "cancelled")
+TERMINAL_STATUSES = ("succeeded", "failed", "cancelled")
+STATUS_CLEANUP_PENDING = "cleanup_pending"
 
 _init_lock = threading.Lock()
 _initialized = False
@@ -85,9 +87,19 @@ def init_db() -> None:
         conn = connect()
         try:
             conn.executescript(SCHEMA)
+            _migrate(conn)
         finally:
             conn.close()
         _initialized = True
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the first schema to existing databases."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "final_status" not in columns:
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN final_status TEXT NOT NULL DEFAULT ''"
+        )
 
 
 def create_task(
@@ -138,6 +150,7 @@ def update_task(
     message: Optional[str] = None,
     result_r1: Optional[str] = None,
     result_r2: Optional[str] = None,
+    final_status: Optional[str] = None,
 ) -> None:
     fields = ["updated_at = ?"]
     values: list = [utcnow()]
@@ -159,26 +172,31 @@ def update_task(
     if result_r2 is not None:
         fields.append("result_r2 = ?")
         values.append(result_r2)
+    if final_status is not None:
+        fields.append("final_status = ?")
+        values.append(final_status)
     values.append(task_id)
     conn.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id = ?", values)
 
 
 def try_set_cancelling(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Atomically move a non-terminal task to 'cancelling'.
+    """Atomically move a cancellable task to 'cancelling'.
 
-    Returns the previous status, or ``None`` when the task does not exist or
-    is already terminal (in which case nothing is changed). The UPDATE itself
-    is conditional, so a task that reaches 'succeeded' concurrently cannot be
-    overwritten.
+    Returns the current status without changing anything when the task is
+    terminal or already parked in 'cleanup_pending' (a task whose cleanup is
+    blocked keeps its booked terminal state; a repeated cancel only nudges
+    the finalization retry). Returns ``None`` when the task does not exist.
+    The UPDATE itself is conditional, so a task that reaches 'succeeded'
+    concurrently cannot be overwritten.
     """
     row = get_task(conn, task_id)
     if row is None:
         return None
-    if row["status"] in _TERMINAL_STATUSES:
+    if row["status"] in TERMINAL_STATUSES or row["status"] == STATUS_CLEANUP_PENDING:
         return row["status"]
     cur = conn.execute(
         "UPDATE tasks SET status = 'cancelling', updated_at = ? "
-        "WHERE id = ? AND status NOT IN ('succeeded', 'failed', 'cancelled')",
+        "WHERE id = ? AND status IN ('pending', 'processing', 'cancelling')",
         (utcnow(), task_id),
     )
     if cur.rowcount == 0:
@@ -204,10 +222,16 @@ def delete_records(conn: sqlite3.Connection, task_id: str) -> None:
     conn.execute("DELETE FROM records WHERE task_id = ?", (task_id,))
 
 
-def non_terminal_task_ids(conn: sqlite3.Connection) -> list[str]:
-    return [
-        row["id"]
-        for row in conn.execute(
-            "SELECT id FROM tasks WHERE status NOT IN ('succeeded','failed','cancelled')"
+def non_terminal_tasks(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Return full rows for every task that still needs finalization.
+
+    This includes 'cleanup_pending' tasks: their terminal state is already
+    booked in ``final_status`` but the staging directory could not be
+    removed yet, so a restart must retry the cleanup.
+    """
+    return list(
+        conn.execute(
+            "SELECT id, status, message, final_status FROM tasks "
+            "WHERE status NOT IN ('succeeded','failed','cancelled')"
         )
-    ]
+    )

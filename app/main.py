@@ -47,6 +47,7 @@ class TaskOut(BaseModel):
     r2_bytes: int
     created_at: str
     updated_at: str
+    final_status: str | None = None
     download_r1: str | None = None
     download_r2: str | None = None
 
@@ -68,9 +69,18 @@ def _serialize(row: sqlite3.Row) -> TaskOut:
         r2_bytes=row["r2_bytes"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        final_status=row["final_status"] or None,
         download_r1=download_r1,
         download_r2=download_r2,
     )
+
+
+def _best_effort_cleanup(task_id: str) -> None:
+    """Remove a rejected upload's staging dir; never mask the real error."""
+    try:
+        worker.cleanup_task_dir(task_id)
+    except worker.CleanupError:
+        pass
 
 
 async def _spool_bounded(upload: UploadFile, side: str, dest: Path) -> int:
@@ -118,7 +128,7 @@ async def create_task(
         size1 = await _spool_bounded(r1, "R1", r1_dest)
         size2 = await _spool_bounded(r2, "R2", r2_dest)
     except UploadTooLarge as exc:
-        worker.cleanup_task_dir(task_id)
+        _best_effort_cleanup(task_id)
         raise HTTPException(
             status_code=getattr(
                 status, "HTTP_413_CONTENT_TOO_LARGE",
@@ -127,7 +137,7 @@ async def create_task(
             detail=str(exc),
         )
     except Exception:
-        worker.cleanup_task_dir(task_id)
+        _best_effort_cleanup(task_id)
         raise
     finally:
         await r1.close()
@@ -171,16 +181,23 @@ def cancel_task(task_id: str) -> TaskOut:
         previous = db.try_set_cancelling(conn, task_id)
         if previous is None:
             raise HTTPException(status_code=404, detail="task not found")
-        row = db.get_task(conn, task_id)
-        if row["status"] in ("succeeded", "failed", "cancelled"):
+        if previous in db.TERMINAL_STATUSES:
             # The task reached a terminal state first; tell the caller plainly
             # that it cannot be cancelled.
             raise HTTPException(
                 status_code=409,
-                detail=f"task is already {row['status']} and cannot be cancelled",
+                detail=f"task is already {previous} and cannot be cancelled",
             )
+        if previous == db.STATUS_CLEANUP_PENDING:
+            # Cleanup was blocked (e.g. staging directory not removable); this
+            # repeated cancel is accepted and nudges a background retry of the
+            # finalization. The task keeps its booked terminal state.
+            worker.retry_finalize(task_id)
+            row = db.get_task(conn, task_id)
+            return _serialize(row)
         # Flip the cooperative flag and return without waiting for the worker.
         worker.request_cancel(task_id)
+        row = db.get_task(conn, task_id)
         return _serialize(row)
     finally:
         conn.close()

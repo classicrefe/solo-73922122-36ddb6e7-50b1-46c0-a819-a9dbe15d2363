@@ -4,12 +4,20 @@ Each upload is processed by a daemon worker thread with its own SQLite
 connection. Cancellation is cooperative: the cancel endpoint flips an event
 and returns immediately, while the worker observes the event at every batch
 boundary and aborts before anything can be published.
+
+Finalization contract: a task may only enter its terminal state
+('cancelled'/'failed') once its original uploads, staging directory and
+parsed read records are all gone. When the staging directory cannot be
+removed (permissions, transient IO errors, ...), the task is parked in
+'cleanup_pending' with the booked terminal state kept in ``final_status``;
+queries then show the task as pending cleanup and downloads stay closed.
+A repeated cancel request or a service restart retries the finalization,
+and only then does the task report its terminal state.
 """
 
 from __future__ import annotations
 
 import shutil
-import sqlite3
 import threading
 from pathlib import Path
 
@@ -28,6 +36,8 @@ _cancel_events: dict[str, threading.Event] = {}
 _registry_lock = threading.Lock()
 # Keep worker threads reachable (mostly for tests / diagnostics).
 _workers: dict[str, threading.Thread] = {}
+# task_id -> thread retrying a blocked finalization (one per task).
+_finalizers: dict[str, threading.Thread] = {}
 
 
 class UploadTooLarge(Exception):
@@ -35,6 +45,10 @@ class UploadTooLarge(Exception):
         self.side = side
         self.limit = limit
         super().__init__(f"{side} exceeds the {limit} byte upload limit")
+
+
+class CleanupError(Exception):
+    """Raised when a task's staging directory cannot be fully removed."""
 
 
 def register_cancel_event(task_id: str) -> threading.Event:
@@ -55,35 +69,126 @@ def task_dir(task_id: str) -> Path:
 
 
 def cleanup_task_dir(task_id: str) -> None:
-    """Remove only this task's own directory; UUID names isolate tasks."""
+    """Remove only this task's own directory; UUID names isolate tasks.
+
+    Raises CleanupError when anything cannot be removed. Callers must not
+    publish a terminal state in that case: the task is parked in
+    'cleanup_pending' instead, so the leftover originals/staging are retried
+    later instead of being silently leaked.
+    """
     path = task_dir(task_id)
-    if path.exists():
-        shutil.rmtree(path, ignore_errors=True)
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass  # Already gone: nothing left to do.
+    except OSError as exc:
+        raise CleanupError(f"cannot remove staging directory {path}: {exc}") from exc
 
 
-def _fail(
-    conn: sqlite3.Connection,
-    task_id: str,
-    message: str,
-    *,
-    cancelled: bool = False,
-) -> None:
-    # Remove files BEFORE publishing the terminal status, so any observer of
-    # 'failed'/'cancelled' is guaranteed the staging directory is already gone.
-    cleanup_task_dir(task_id)
-    db.delete_records(conn, task_id)
-    db.update_task(
-        conn,
-        task_id,
-        status="cancelled" if cancelled else "failed",
-        stage=config.STAGE_DONE,
-        progress=1.0 if cancelled else 0.0,
-        message=message,
-        result_r1="",
-        result_r2="",
-    )
+def finalize_task(task_id: str, *, cancelled: bool, message: str) -> bool:
+    """Clean up after a stopped task, then publish its terminal state.
+
+    The task's read records are deleted and its staging directory (original
+    uploads, temp outputs) removed first; only when both succeed is the
+    status moved to 'cancelled' or 'failed' and ``True`` returned. If the
+    directory cannot be removed, the task is parked in 'cleanup_pending'
+    with the booked terminal state in ``final_status`` and ``False`` is
+    returned — a repeated cancel or a restart will resume the finalization.
+    The original ``message`` (failure reason / cancellation note) is kept
+    unchanged in both outcomes.
+    """
+    final = "cancelled" if cancelled else "failed"
+    conn = db.connect()
+    try:
+        row = db.get_task(conn, task_id)
+        if row is None or row["status"] in db.TERMINAL_STATUSES:
+            # Nothing to do, and never touch a task that already reached its
+            # terminal state (in particular published results of a succeeded
+            # task must survive).
+            return True
+        db.delete_records(conn, task_id)
+        try:
+            cleanup_task_dir(task_id)
+        except CleanupError:
+            db.update_task(
+                conn,
+                task_id,
+                status=db.STATUS_CLEANUP_PENDING,
+                stage=config.STAGE_CLEANUP,
+                message=message,
+                final_status=final,
+            )
+            return False
+        db.update_task(
+            conn,
+            task_id,
+            status=final,
+            stage=config.STAGE_DONE,
+            progress=1.0 if cancelled else 0.0,
+            message=message,
+            result_r1="",
+            result_r2="",
+            final_status="",
+        )
+        return True
+    finally:
+        conn.close()
+        with _registry_lock:
+            _cancel_events.pop(task_id, None)
+
+
+def retry_finalize(task_id: str) -> None:
+    """Resume a blocked finalization in the background.
+
+    Used when a cancel request arrives for a 'cleanup_pending' task: the
+    request is accepted immediately and this thread re-attempts the cleanup
+    so the task can reach its booked terminal state.
+    """
     with _registry_lock:
-        _cancel_events.pop(task_id, None)
+        existing = _finalizers.get(task_id)
+        if existing is not None and existing.is_alive():
+            return
+        thread = threading.Thread(
+            target=_retry_finalize,
+            args=(task_id,),
+            name=f"fastq-finalize-{task_id[:8]}",
+            daemon=True,
+        )
+        _finalizers[task_id] = thread
+        thread.start()
+
+
+def _retry_finalize(task_id: str) -> None:
+    try:
+        conn = db.connect()
+        try:
+            row = db.get_task(conn, task_id)
+        finally:
+            conn.close()
+        if row is None or row["status"] != db.STATUS_CLEANUP_PENDING:
+            return
+        finalize_task(
+            task_id,
+            cancelled=row["final_status"] == "cancelled",
+            message=row["message"],
+        )
+    finally:
+        with _registry_lock:
+            _finalizers.pop(task_id, None)
+
+
+def _cancel_requested(conn, task_id: str, event: threading.Event) -> bool:
+    """True once a cancel has been accepted for this task.
+
+    The in-memory event is the fast path; the database status closes the
+    race in which the cancel endpoint has already flipped the row to
+    'cancelling' but has not set the event yet — an accepted cancel must
+    always lead to the 'cancelled' terminal state.
+    """
+    if event.is_set():
+        return True
+    row = db.get_task(conn, task_id)
+    return row is not None and row["status"] == "cancelling"
 
 
 def run_task(task_id: str) -> None:
@@ -174,17 +279,23 @@ def run_task(task_id: str) -> None:
             except OSError:
                 pass
     except TaskCancelled:
-        _fail(conn, task_id, "task cancelled before completion", cancelled=True)
+        finalize_task(
+            task_id, cancelled=True, message="task cancelled before completion"
+        )
     except FastqFormatError as exc:
-        if event.is_set():
-            _fail(conn, task_id, "task cancelled before completion", cancelled=True)
+        if _cancel_requested(conn, task_id, event):
+            finalize_task(
+                task_id, cancelled=True, message="task cancelled before completion"
+            )
         else:
-            _fail(conn, task_id, f"rejected: {exc}")
+            finalize_task(task_id, cancelled=False, message=f"rejected: {exc}")
     except Exception as exc:  # noqa: BLE001 - any failure fails the whole task
-        if event.is_set():
-            _fail(conn, task_id, "task cancelled before completion", cancelled=True)
+        if _cancel_requested(conn, task_id, event):
+            finalize_task(
+                task_id, cancelled=True, message="task cancelled before completion"
+            )
         else:
-            _fail(conn, task_id, f"unexpected error: {exc!r}")
+            finalize_task(task_id, cancelled=False, message=f"unexpected error: {exc!r}")
     finally:
         conn.close()
         with _registry_lock:
@@ -201,29 +312,44 @@ def start_worker(task_id: str) -> None:
 
 
 def recover_on_startup() -> dict[str, int]:
-    """Mark unfinished tasks failed and remove their staging files.
+    """Resume finalization for every task that is not in a terminal state.
 
+    - 'cleanup_pending' tasks (cleanup was blocked before the restart) retry
+      their cleanup and then report the terminal state booked in
+      ``final_status``, keeping the original message;
+    - 'cancelling' tasks (cancel was accepted) finish as 'cancelled';
+    - 'pending'/'processing' tasks were interrupted mid-flight and finish as
+      'failed' once their staging is gone.
+
+    If a staging directory still cannot be removed, the task stays in
+    'cleanup_pending' and the next cancel request or restart retries again.
     Succeeded tasks keep their result files and remain downloadable.
     """
     conn = db.connect()
-    recovered = 0
     try:
-        ids = db.non_terminal_task_ids(conn)
-        for task_id in ids:
-            db.delete_records(conn, task_id)
-            db.update_task(
-                conn,
-                task_id,
-                status="failed",
-                stage=config.STAGE_DONE,
-                progress=0.0,
-                message="interrupted by service restart",
-                result_r1="",
-                result_r2="",
-            )
-            cleanup_task_dir(task_id)
-            recovered += 1
+        rows = db.non_terminal_tasks(conn)
     finally:
         conn.close()
+    finalized = 0
+    still_pending = 0
+    for row in rows:
+        status = row["status"]
+        if status == db.STATUS_CLEANUP_PENDING:
+            cancelled = row["final_status"] == "cancelled"
+            message = row["message"]
+        elif status == "cancelling":
+            cancelled = True
+            message = "task cancelled before completion"
+        else:
+            cancelled = False
+            message = "interrupted by service restart"
+        try:
+            done = finalize_task(row["id"], cancelled=cancelled, message=message)
+        except Exception:  # noqa: BLE001 - one bad task must not block others
+            done = False
+        if done:
+            finalized += 1
+        else:
+            still_pending += 1
     # Cancellation registry is empty in a fresh process.
-    return {"recovered": recovered}
+    return {"finalized": finalized, "cleanup_pending": still_pending}
